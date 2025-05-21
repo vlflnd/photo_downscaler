@@ -5,14 +5,13 @@ import sys
 import argparse
 import logging
 from pathlib import Path
-from datetime import datetime
-import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 import json
 import shutil
 import subprocess
 import time
+from threading import Lock
 
 # Configure logging
 logging.basicConfig(
@@ -22,29 +21,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global folder renaming map
-# Format: "original/path" -> "renamed path"
-# Example: "Wallpapers/Nature" -> "Wallpapers - Nature"
-FOLDER_RENAME_MAP = {
-    "Wallpapers/Nature": "Wallpapers - Nature",
-    "Wallpapers/Family": "Wallpapers - Family",
-}
-
 class MediaDownscaler:
-    def __init__(self, input_dirs, output_dir, max_size=(1920, 1080), quality=75, workers=4, rename_map=None,
-                 video_preset="medium", video_crf=23, exclude_paths=None):
+    def __init__(self, input_dirs, output_dir, max_size, quality, workers,
+                 video_preset, video_crf, exclude_paths=None):
         """
         Initialize the media downscaler.
         
         Args:
             input_dirs: List of directories containing the original media files
             output_dir: Directory to save downscaled media files
-            max_size: Maximum dimensions (width, height) for the downscaled images
+            max_size: Maximum dimensions (width, height) for the downscaled images/videos
             quality: JPEG quality (1-100)
             workers: Number of worker threads
-            rename_map: Dictionary mapping original folder paths to renamed paths
             video_preset: FFmpeg preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)
-            video_crf: Constant Rate Factor for video quality (0-51, lower is better quality, 23 is default)
+            video_crf: Constant Rate Factor for video quality (0-51, lower is better quality)
             exclude_paths: List of path components to exclude from processing
         """
         self.input_dirs = [Path(d) for d in input_dirs]
@@ -52,19 +42,26 @@ class MediaDownscaler:
         self.max_size = max_size
         self.quality = quality
         self.workers = workers
-        self.rename_map = rename_map or FOLDER_RENAME_MAP
         self.metadata_file = self.output_dir / "photo_downscaler.metadata.json"
         self.processed_files = self._load_processed_files()
         self.video_preset = video_preset
         self.video_crf = video_crf
-        self.last_flush_time = time.time()  # Initialize flush time
-        self.exclude_paths = set(exclude_paths or [])  # Convert to set for faster lookups
+        self.last_flush_time = time.time()
+        self.exclude_paths = set(exclude_paths or [])
+        
+        # Add counters for tracking progress
+        self.skipped_files = 0
+        self.skipped_files_lock = Lock()
+        self.last_status_time = time.time()
         
         # Check if FFmpeg is available
         self.ffmpeg_available = self._check_ffmpeg()
         
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Clean up metadata entries for non-existing files
+        self._cleanup_metadata()
     
     def _check_ffmpeg(self):
         """Check if FFmpeg is available on the system."""
@@ -106,20 +103,16 @@ class MediaDownscaler:
             logger.error(f"Error saving processed files metadata: {e}")
     
     def _get_file_hash(self, file_path):
-        """Calculate a hash of the file for tracking changes."""
+        """Calculate a file thumbprint using size and modification time."""
         try:
-            # For large files like videos, only hash the first 10MB to save time
-            file_size = os.path.getsize(file_path)
-            hash_size = min(10 * 1024 * 1024, file_size)  # 10MB or file size, whichever is smaller
-            
-            with open(file_path, 'rb') as f:
-                file_content = f.read(hash_size)
-                # Add modification time and file size to the hash for better uniqueness
-                mod_time = str(os.path.getmtime(file_path)).encode()
-                size_bytes = str(file_size).encode()
-                return hashlib.md5(file_content + mod_time + size_bytes).hexdigest()
+            # Get file stats
+            stats = os.stat(file_path)
+            # Combine size and modification time into a string and hash it
+            # Using nanosecond precision for modification time
+            thumbprint = f"{stats.st_size}_{stats.st_mtime_ns}"
+            return thumbprint
         except Exception as e:
-            logger.error(f"Error calculating hash for {file_path}: {e}")
+            logger.error(f"Error getting file thumbprint for {file_path}: {e}")
             return None
     
     def _is_image_file(self, file_path):
@@ -137,58 +130,35 @@ class MediaDownscaler:
         # Check if any part of the path matches an excluded component
         return any(excluded in path.parts for excluded in self.exclude_paths)
     
-    def _get_renamed_path(self, rel_path):
-        """
-        Get renamed path based on the folder rename map.
-        
-        Args:
-            rel_path: Relative path from input directory
-            
-        Returns:
-            Path object with renamed directories if matching rules found
-        """
-        # Convert to string for matching
-        path_str = str(rel_path).replace('\\', '/')
-        
-        # Check if any patterns in rename map match the start of the path
-        for original, renamed in self.rename_map.items():
-            # Normalize path separators to forward slashes for matching
-            original_norm = original.replace('\\', '/')
-            
-            # If the path starts with the pattern followed by a slash or if it equals the pattern exactly
-            if path_str.startswith(original_norm + '/') or path_str == original_norm:
-                # Replace the matched pattern with its renamed version
-                new_path = path_str.replace(original_norm, renamed, 1)
-                return Path(new_path)
-        
-        # No matches found, return the original path
-        return rel_path
-    
     def _get_output_path(self, file_path):
-        """Generate the output path for a file using renaming rules while preserving directory structure."""
-        # Get relative path from input directory
-        rel_path = None
-        for input_dir in self.input_dirs:
+        """Generate the output path for a file while preserving directory structure including the top-level directory."""
+        # Find which input directory contains this file
+        input_dir = None
+        for d in self.input_dirs:
             try:
-                rel_path = file_path.relative_to(input_dir)
-                break
+                if file_path.is_relative_to(d):
+                    input_dir = d
+                    break
             except ValueError:
                 continue
         
-        if rel_path is None:
+        if input_dir is None:
             logger.error(f"File {file_path} is not in any input directory")
             return None, None, None
         
-        # Check if the path matches any renaming rules
-        renamed_path = self._get_renamed_path(rel_path)
+        # Get the full relative path including the input directory name
+        rel_path = file_path.relative_to(input_dir.parent)
         
         # Create output path preserving directory structure
-        output_path = self.output_dir / renamed_path
+        output_path = self.output_dir / rel_path
         
         # Create output directories if they don't exist
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        return output_path, str(rel_path), str(renamed_path)
+        # Convert paths to forward slashes for metadata storage
+        rel_path_str = str(rel_path).replace('\\', '/')
+        
+        return output_path, rel_path_str, rel_path_str
     
     def _check_and_flush_metadata(self):
         """Check if 30 seconds have passed since last flush and save if needed."""
@@ -197,9 +167,19 @@ class MediaDownscaler:
             self._save_processed_files()
             self.last_flush_time = current_time
     
+    def _update_skipped_count(self):
+        """Update skipped files count and log status periodically."""
+        with self.skipped_files_lock:
+            self.skipped_files += 1
+            current_time = time.time()
+            if current_time - self.last_status_time >= 10:  # Log every 10 seconds
+                logger.info(f"Skipped {self.skipped_files} files so far")
+                self.last_status_time = current_time
+    
     def _process_image(self, image_path):
         """Process a single image file."""
         if self._should_skip_path(image_path):
+            self._update_skipped_count()
             return True
         
         # Get output path and path strings
@@ -212,6 +192,7 @@ class MediaDownscaler:
         
         # Check if file has already been processed and hasn't changed
         if rel_path_str in self.processed_files and self.processed_files[rel_path_str] == file_hash:
+            self._update_skipped_count()
             return True
         
         try:
@@ -232,11 +213,13 @@ class MediaDownscaler:
                 # Calculate new dimensions while maintaining aspect ratio
                 img.thumbnail(self.max_size, Image.LANCZOS)
                 
-                # Save the resized image, preserving format and quality
+                # Save the resized image with optimized settings
                 save_kwargs = {
                     'format': img_format,
                     'quality': self.quality,
-                    'optimize': True
+                    'optimize': True,  # Enable Huffman table optimization
+                    'progressive': True,  # Use progressive JPEG for better compression
+                    'subsampling': 2  # Use 4:2:0 chroma subsampling for better compression
                 }
                 
                 # Add EXIF data if we have it
@@ -262,6 +245,7 @@ class MediaDownscaler:
     def _process_video(self, video_path):
         """Process a single video file using FFmpeg."""
         if self._should_skip_path(video_path):
+            self._update_skipped_count()
             return True
         
         # Get output path and path strings
@@ -274,21 +258,27 @@ class MediaDownscaler:
         
         # Check if file has already been processed and hasn't changed
         if rel_path_str in self.processed_files and self.processed_files[rel_path_str] == file_hash:
+            self._update_skipped_count()
             return True
         
         try:
             # Ensure output is mp4 for best compatibility
             output_path = output_path.with_suffix('.mp4')
             
-            # Build FFmpeg command for smartphone-friendly video
-            # -vf scale parameters ensure we don't upscale small videos
+            # Ensure dimensions are even numbers
+            # Round down to nearest even number to maintain aspect ratio
+            max_width = self.max_size[0] - (self.max_size[0] % 2)
+            max_height = self.max_size[1] - (self.max_size[1] % 2)
+            
+            # Build FFmpeg command for smartphone-friendly video with reduced quality
             cmd = [
                 "ffmpeg", "-y", "-i", str(video_path),
                 "-c:v", "libx264", "-preset", self.video_preset, "-crf", str(self.video_crf),
-                "-c:a", "aac", "-b:a", "128k",
-                "-vf", f"scale='min({self.max_size[0]},iw)':'min({self.max_size[1]},ih)':force_original_aspect_ratio=decrease",
+                "-c:a", "aac", "-b:a", "96k",  # Reduced audio bitrate
+                "-vf", f"scale='min({max_width},iw)':'min({max_height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",  # Force even dimensions
                 "-movflags", "+faststart",  # Optimize for web streaming
                 "-metadata", "title=",  # Clear metadata to save space
+                "-max_muxing_queue_size", "1024",  # Prevent potential muxing errors
                 str(output_path)
             ]
             
@@ -321,15 +311,28 @@ class MediaDownscaler:
             return False
     
     def _delete_removed_files(self, current_files):
-        """Delete files from output directory that no longer exist in the input directory."""
-        current_relative_paths = {str(p.relative_to(self.input_dirs[0])) for p in current_files}
+        """Delete files from output directory that no longer exist in any input directory."""
+        # Get all current files relative to their respective input directories
+        current_relative_paths = set()
+        for file_path in current_files:
+            # Find which input directory contains this file
+            for input_dir in self.input_dirs:
+                try:
+                    if file_path.is_relative_to(input_dir):
+                        # Get path relative to input directory's parent to match metadata format
+                        rel_path = str(file_path.relative_to(input_dir.parent)).replace('\\', '/')
+                        current_relative_paths.add(rel_path)
+                        break
+                except ValueError:
+                    continue
+        
         files_to_remove = []
         
-        # Find files that no longer exist in the input directory
+        # Find files that no longer exist in any input directory
         for rel_path in list(self.processed_files.keys()):
             if rel_path not in current_relative_paths:
                 # Get the output path using the same path resolution logic as processing
-                output_path = self.output_dir / self._get_renamed_path(Path(rel_path))
+                output_path = self.output_dir / Path(rel_path)
                 files_to_remove.append((rel_path, output_path))
         
         # Delete files and their entries in processed_files
@@ -358,6 +361,10 @@ class MediaDownscaler:
 
     def process_directory(self):
         """Process all media files in the input directories."""
+        # Reset counters at start of processing
+        self.skipped_files = 0
+        self.last_status_time = time.time()
+        
         all_files = []
         all_image_files = []
         all_video_files = []
@@ -378,20 +385,20 @@ class MediaDownscaler:
             all_image_files.extend(image_files)
             all_video_files.extend(video_files)
         
-        all_files = all_image_files + all_video_files
+        all_files = all_video_files + all_image_files  # Videos first, then images
         
-        logger.info(f"Found {len(all_image_files)} image files and {len(all_video_files)} video files to process")
+        # Convert existing metadata paths to forward slashes
+        self.processed_files = {k.replace('\\', '/'): v for k, v in self.processed_files.items()}
+        
+        logger.info(f"Found {len(all_video_files)} video files and {len(all_image_files)} image files to process")
+        logger.info("Processing videos first, then images...")
         
         # Process files with thread pool
         results = []
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            # Process images
-            if all_image_files:
-                img_results = list(executor.map(self._process_image, all_image_files))
-                results.extend(img_results)
-                
-            # Process videos (serially if only 1 worker to avoid overloading)
+            # Process videos first
             if all_video_files:
+                logger.info("Starting video processing...")
                 if self.workers == 1 or len(all_video_files) == 1:
                     # Process videos serially if only one worker
                     video_results = [self._process_video(video) for video in all_video_files]
@@ -401,6 +408,14 @@ class MediaDownscaler:
                     with ThreadPoolExecutor(max_workers=video_workers) as video_executor:
                         video_results = list(video_executor.map(self._process_video, all_video_files))
                 results.extend(video_results)
+                logger.info("Video processing complete")
+            
+            # Then process images
+            if all_image_files:
+                logger.info("Starting image processing...")
+                img_results = list(executor.map(self._process_image, all_image_files))
+                results.extend(img_results)
+                logger.info("Image processing complete")
         
         # Delete files that no longer exist in any source directory
         self._delete_removed_files(all_files)
@@ -413,6 +428,39 @@ class MediaDownscaler:
         logger.info(f"Processing complete. Successfully processed {successful} of {len(all_files)} files.")
         
         return True
+
+    def _cleanup_metadata(self):
+        """Remove metadata entries for files that no longer exist in the output directory."""
+        if not self.output_dir.exists():
+            return
+
+        # Get all files in the output directory
+        existing_files = set()
+        for file_path in self.output_dir.glob('**/*'):
+            if file_path.is_file():
+                # Convert to relative path with forward slashes for comparison
+                rel_path = str(file_path.relative_to(self.output_dir)).replace('\\', '/')
+                existing_files.add(rel_path)
+
+        # Find and remove entries for non-existing files
+        files_to_remove = []
+        for rel_path in list(self.processed_files.keys()):
+            # For videos, check both .mp4 and original extension
+            if rel_path not in existing_files:
+                # Try with .mp4 extension for videos
+                mp4_path = rel_path.rsplit('.', 1)[0] + '.mp4'
+                if mp4_path not in existing_files:
+                    files_to_remove.append(rel_path)
+
+        # Remove entries for non-existing files
+        for rel_path in files_to_remove:
+            del self.processed_files[rel_path]
+            logger.info(f"Removed metadata entry for non-existing file: {rel_path}")
+
+        # Save the cleaned metadata if any entries were removed
+        if files_to_remove:
+            self._save_processed_files()
+            logger.info(f"Cleaned up {len(files_to_remove)} metadata entries for non-existing files")
 
 def main():
     parser = argparse.ArgumentParser(description="Downscale photos and videos while preserving directory structure")
@@ -433,17 +481,53 @@ def main():
         return 1
     
     # Validate required configuration fields
-    required_fields = ['input_dirs', 'output_dir']
+    required_fields = [
+        'input_dirs',
+        'output_dir',
+        'width',
+        'height',
+        'quality',
+        'workers',
+        'video_preset',
+        'video_crf'
+    ]
     missing_fields = [field for field in required_fields if field not in config]
     if missing_fields:
         logger.error(f"Missing required configuration fields: {', '.join(missing_fields)}")
         return 1
     
+    # Validate numeric fields
+    try:
+        width = int(config['width'])
+        height = int(config['height'])
+        quality = int(config['quality'])
+        workers = int(config['workers'])
+        video_crf = int(config['video_crf'])
+        
+        if not (0 < width <= 7680 and 0 < height <= 4320):  # Max 8K resolution
+            logger.error("Invalid resolution: width and height must be between 1 and 7680/4320")
+            return 1
+        if not (1 <= quality <= 100):
+            logger.error("Invalid quality: must be between 1 and 100")
+            return 1
+        if not (1 <= workers <= 32):
+            logger.error("Invalid workers: must be between 1 and 32")
+            return 1
+        if not (0 <= video_crf <= 51):
+            logger.error("Invalid video_crf: must be between 0 and 51")
+            return 1
+        if config['video_preset'] not in ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow']:
+            logger.error("Invalid video_preset: must be one of ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow")
+            return 1
+    except ValueError as e:
+        logger.error(f"Invalid numeric value in configuration: {e}")
+        return 1
+    
     logger.info(f"Starting media downscaler")
     logger.info(f"Input directories: {', '.join(config['input_dirs'])}")
     logger.info(f"Output directory: {config['output_dir']}")
-    logger.info(f"Max dimensions: {config.get('width', 1920)}x{config.get('height', 1080)}, Image quality: {config.get('quality', 75)}%")
-    logger.info(f"Video settings: preset={config.get('video_preset', 'medium')}, crf={config.get('video_crf', 23)}")
+    logger.info(f"Max dimensions: {config['width']}x{config['height']}, Image quality: {config['quality']}%")
+    logger.info(f"Video settings: preset={config['video_preset']}, crf={config['video_crf']}")
     if config.get('exclude_paths'):
         logger.info(f"Excluding paths containing: {', '.join(config['exclude_paths'])}")
     
@@ -451,12 +535,11 @@ def main():
     downscaler = MediaDownscaler(
         input_dirs=config['input_dirs'],
         output_dir=config['output_dir'],
-        max_size=(config.get('width', 1920), config.get('height', 1080)),
-        quality=config.get('quality', 75),
-        workers=config.get('workers', 4),
-        rename_map=config.get('rename_map'),
-        video_preset=config.get('video_preset', 'medium'),
-        video_crf=config.get('video_crf', 23),
+        max_size=(width, height),
+        quality=quality,
+        workers=workers,
+        video_preset=config['video_preset'],
+        video_crf=video_crf,
         exclude_paths=config.get('exclude_paths')
     )
     

@@ -5,7 +5,7 @@ A Python tool for downscaling photos and videos while preserving directory struc
 ## Features
 
 - Downscales both images and videos to specified dimensions
-- Preserves directory structure and supports folder renaming
+- Preserves directory structure
 - Maintains EXIF data for images
 - Configurable quality settings for both images and videos
 - Efficient parallel processing with configurable worker threads
@@ -55,11 +55,7 @@ Create a `config.json` file in the project directory with the following structur
     "workers": 4,
     "video_preset": "medium",
     "video_crf": 23,
-    "exclude_paths": ["Bulk", "Temp"],
-    "rename_map": {
-        "Wallpapers/Nature": "Wallpapers - Nature",
-        "Wallpapers/Family": "Wallpapers - Family"
-    }
+    "exclude_paths": ["Bulk", "Temp"]
 }
 ```
 
@@ -74,7 +70,6 @@ Create a `config.json` file in the project directory with the following structur
 - `video_preset`: FFmpeg preset for video processing (default: "medium")
 - `video_crf`: Constant Rate Factor for video quality (0-51, lower is better, default: 23)
 - `exclude_paths`: List of path components to exclude from processing
-- `rename_map`: Dictionary mapping original folder paths to renamed paths
 
 ## Usage
 
